@@ -27,6 +27,50 @@
 ### 2.1. Пользовательские сценарии
 
 #### Сценарий 1: Владелец потерял животное
+
+```mermaid
+sequenceDiagram
+    actor User as Владелец
+    participant TG as Telegram/VK/Web
+    participant GW as API Gateway
+    participant PS as Post Service
+    participant AIS as AI Service
+    participant S3 as Object Storage
+    participant VDB as Vector DB
+    participant PDB as PostgreSQL
+    participant NS as Notification Service
+
+    User->>TG: Загружает фото и место пропажи
+    TG->>GW: POST /lost-pets (фото, гео, описание)
+    GW->>PS: Создать объявление
+    PS->>S3: Сохранить фото (получить URL)
+    S3-->>PS: URL
+    PS->>AIS: Анализировать фото (async)
+    PS->>PDB: Сохранить объявление (без embedding)
+    PS-->>GW: Объявление создано (статус processing)
+    GW-->>TG: Успех, ждите анализа
+
+    Note over AIS: Фоновая обработка
+    AIS->>S3: Загрузить фото по URL
+    S3-->>AIS: Файл
+    AIS->>AIS: Извлечь embedding (ResNet/EfficientNet)
+    AIS->>VDB: Сохранить вектор (связь с pet_id)
+    AIS->>PDB: Обновить запись (embedding, статус active)
+
+    Note over AIS: Автоматический поиск совпадений с найденными
+    AIS->>VDB: Поиск ближайших векторов (найденные животные)
+    VDB-->>AIS: Список кандидатов
+    loop по каждому кандидату
+        AIS->>AIS: Оценка схожести > порога (85%)
+        alt если совпадение найдено
+            AIS->>PS: Создать Match
+            PS->>PDB: Сохранить Match
+            PS->>NS: Отправить уведомление владельцу и нашедшему
+            NS->>TG: Push/Telegram/VK-уведомление
+        end
+    end
+```
+
 1. Пользователь авторизуется в системе (Telegram/VK/веб)
 2. Загружает 1-3 фотографии пропавшего животного
 3. Указывает место пропажи (геолокация или адрес)
@@ -36,6 +80,48 @@
 7. При обнаружении совпадения с найденным животным пользователь получает уведомление
 
 #### Сценарий 2: Пользователь нашёл животное
+
+```mermaid
+sequenceDiagram
+    actor Finder as Нашедший
+    participant TG as Telegram/VK/Web
+    participant GW as API Gateway
+    participant PS as Post Service
+    participant AIS as AI Service
+    participant S3 as Object Storage
+    participant VDB as Vector DB
+    participant PDB as PostgreSQL
+    participant NS as Notification Service
+
+    Finder->>TG: Загружает фото найденного животного + место
+    TG->>GW: POST /found-pets (фото, гео)
+    GW->>PS: Создать объявление о найденном
+    PS->>S3: Сохранить фото
+    S3-->>PS: URL
+    PS->>AIS: Анализировать и найти совпадения (синхронно или async)
+    PS-->>GW: Объявление создано, идёт поиск
+    GW-->>TG: Успех
+
+    AIS->>S3: Загрузить фото
+    S3-->>AIS: Файл
+    AIS->>AIS: Извлечь embedding
+    AIS->>VDB: Поиск среди потерянных животных
+    VDB-->>AIS: Список кандидатов с оценками
+    AIS->>PDB: Сохранить embedding для найденного
+
+    alt есть совпадения > порога
+        AIS->>PS: Создать Match(и)
+        PS->>PDB: Сохранить Match
+        PS->>NS: Уведомить владельца потерянного
+        NS->>TG: Уведомление "Возможно, ваше животное найдено!"
+        PS-->>GW: Вернуть совпадения
+        GW-->>TG: Показать контакты владельца (если подтверждено)
+    else нет совпадений
+        PS-->>GW: Совпадений не найдено
+        GW-->>TG: Объявление опубликовано как найденное
+    end
+```
+
 1. Пользователь авторизуется в системе
 2. Загружает фотографию найденного животного
 3. Указывает место находки
@@ -50,6 +136,8 @@
 4. При клике на маркер открывается карточка с фото и информацией
 
 ### 2.2. Модули системы
+
+
 
 #### 2.2.1. Модуль авторизации и управления пользователями
 - Регистрация/вход через Telegram, VK (OAuth 2.0)
@@ -200,109 +288,131 @@ ___
 
 ## 5. Архитектура системы
 
-```text
-┌─────────────────────────────────────────────────────────────────┐
-│                        Клиенты                                  │
-├─────────────┬─────────────────┬───────────────┬────────────────-┤
-│ Telegram Bot│  VK Mini App    │  Web Frontend │  Mobile Web     │
-└──────┬──────┴────────┬────────┴───────┬───────┴───────┬────────-┘
-       │               │                │               │
-       └───────────────┼────────────────┴───────────────┘
-                       │
-                       ▼
-              ┌─────────────────┐
-              │   API Gateway   │ (FastAPI)
-              │   (Auth, Rate   │
-              │    Limiting)    │
-              └────────┬────────┘
-                       │
-         ┌─────────────┼─────────────┐
-         │             │             │
-         ▼             ▼             ▼
-┌─────────────────┐ ┌─────────────┐ ┌─────────────────┐
-│  User Service   │ │  Post       │ │  Notification   │
-│  (регистрация,  │ │  Service    │ │  Service        │
-│   профили)      │ │ (объявления)│ │ (Telegram/VK/   │
-└─────────────────┘ └──────┬──────┘ │  Email)         │
-                           │        └─────────────────┘
-                           ▼
-                  ┌─────────────────┐
-                  │   AI Service    │
-                  │ (FastAPI + ML)  │
-                  └────────┬────────┘
-                           │
-         ┌─────────────────┼─────────────────┐
-         │                 │                 │
-         ▼                 ▼                 ▼
-┌─────────────────┐ ┌─────────────┐ ┌─────────────────┐
-│  PostgreSQL     │ │  Vector DB  │ │  Object Storage │
-│  + PostGIS      │ │ (Milvus/    │ │  (S3)           │
-│  (объявления,   │ │  Qdrant)    │ │  (фото)         │
-│   пользователи, │ │ (embeddings)│ │                 │
-│   геоданные)    │ └─────────────┘ └─────────────────┘
-└─────────────────┘
-```
+```mermaid
+graph TB
+    subgraph Клиенты
+        TG[Telegram Bot]
+        VK[VK Mini App]
+        WEB[Web Frontend]
+    end
 
+    subgraph Шлюз
+        GW[API Gateway<br>FastAPI / Django]
+    end
+
+    subgraph Сервисы
+        US[User Service<br>авторизация, профили]
+        PS[Post Service<br>объявления]
+        NS[Notification Service<br>уведомления]
+        AIS[AI Service<br>распознавание + поиск]
+    end
+
+    subgraph Хранилища
+        PDB[(PostgreSQL + PostGIS<br>пользователи, объявления, гео)]
+        VDB[(Vector DB<br>Milvus/Qdrant<br>embeddings)]
+        S3[(Object Storage<br>S3<br>фото)]
+        RD[(Redis<br>кеш + очереди)]
+    end
+
+    TG --> GW
+    VK --> GW
+    WEB --> GW
+
+    GW --> US
+    GW --> PS
+    GW --> NS
+    GW --> AIS
+
+    US --> PDB
+    PS --> PDB
+    PS --> S3
+    NS --> RD
+    AIS --> VDB
+    AIS --> S3
+    AIS --> PDB
+    AIS --> RD
+
+    PS -.-> AIS
+    NS -.-> TG
+    NS -.-> VK
+```
 ---
 
 ## 6. Модель данных (основные сущности)
 
-### User
+```mermaid
+classDiagram
+    class User {
+        +UUID id
+        +str telegram_id
+        +str vk_id
+        +str email
+        +str phone
+        +str password_hash
+        +datetime created_at
+        +login()
+        +create_pet()
+    }
 
-- id — UUID
-- telegram_id — string (optional)
-- vk_id — string (optional)
-- email — string
-- phone — string
-- password_hash — string
-- created_at — timestamp
-- updated_at — timestamp
+    class Pet {
+        +UUID id
+        +UUID owner_id
+        +str name
+        +enum species
+        +str breed
+        +str color
+        +str description
+        +list photo_urls
+        +vector embedding
+        +datetime created_at
+        +get_embedding()
+    }
 
-### Pet
+    class LostPet {
+        +date lost_date
+        +Point lost_location
+        +str lost_address
+        +enum status
+        +close_as_found()
+    }
 
-- id — UUID
-- owner_id — UUID (User)
-- name — string
-- species — enum (cat, dog, other)
-- breed — string
-- color — string
-- description — text
-- photo_urls — array[string]
-- embedding — vector (для поиска)
-- created_at — timestamp
+    class FoundPet {
+        +date found_date
+        +Point found_location
+        +str found_address
+        +enum status
+        +return_to_owner()
+    }
 
-### LostPet (наследует Pet)
+    class Match {
+        +UUID id
+        +UUID lost_pet_id
+        +UUID found_pet_id
+        +float similarity_score
+        +enum status
+        +datetime created_at
+        +confirm()
+        +reject()
+    }
 
-- lost_date — date
-- lost_location — geometry (Point)
-- lost_address — string
-- status — enum (active, found, closed)
+    class Notification {
+        +UUID id
+        +UUID user_id
+        +enum type
+        +str title
+        +str message
+        +bool read
+        +datetime created_at
+        +send()
+    }
 
-### FoundPet (наследует Pet)
-
-- found_date — date
-- found_location — geometry (Point)
-- found_address — string
-- status — enum (active, returned, closed)
-
-### Match
-
-- id — UUID
-- lost_pet_id — UUID
-- found_pet_id — UUID
-- similarity_score — float (0-1)
-- status — enum (pending, confirmed, rejected)
-- created_at — timestamp
-
-### Notification
-
-- id — UUID
-- user_id — UUID
-- type — enum (telegram, vk, email, push)
-- title — string
-- message — text
-- read — boolean
-- created_at — timestamp
+    User "1" --> "*" Pet : владеет
+    Pet <|-- LostPet : расширяет
+    Pet <|-- FoundPet : расширяет
+    LostPet "1" --> "0..1" Match : участвует
+    FoundPet "1" --> "0..1" Match : участвует
+    User "1" --> "*" Notification : получает
+```
 
 --- 
 
